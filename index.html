@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Worm Universe · Arrow Control</title>
+    <style>
+        * {
+            user-select: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        body {
+            background: radial-gradient(circle at 20% 30%, #0a0f1e, #03060c);
+            overflow: hidden;
+            margin: 0;
+            padding: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: 'Segoe UI', 'Courier New', monospace;
+        }
+
+        #canvas {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            touch-action: pinch-zoom;
+            border: 3px solid #2c3e2f;
+            border-radius: 28px;
+            box-shadow: 0 20px 35px rgba(0,0,0,0.5), inset 0 0 20px rgba(0,255,100,0.1);
+            cursor: none;
+        }
+
+        .game-stats {
+            position: fixed;
+            bottom: 18px;
+            left: 18px;
+            background: rgba(0,0,0,0.7);
+            backdrop-filter: blur(8px);
+            border-radius: 32px;
+            padding: 10px 20px;
+            color: #bfffcf;
+            font-weight: bold;
+            font-size: 1.2rem;
+            font-family: monospace;
+            letter-spacing: 1px;
+            pointer-events: none;
+            z-index: 100;
+            border-left: 4px solid #6eff9e;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        }
+
+        .game-stats span {
+            color: #ffd966;
+            font-size: 1.5rem;
+            font-weight: bold;
+        }
+
+        .controls-tip {
+            position: fixed;
+            bottom: 18px;
+            right: 18px;
+            background: rgba(0,0,0,0.6);
+            backdrop-filter: blur(5px);
+            border-radius: 24px;
+            padding: 8px 18px;
+            font-size: 0.85rem;
+            color: #aaffcc;
+            font-family: monospace;
+            pointer-events: none;
+            z-index: 100;
+            font-weight: bold;
+            letter-spacing: 1px;
+        }
+
+        @media (max-width: 700px) {
+            .controls-tip { font-size: 0.7rem; padding: 5px 12px; }
+            .game-stats { font-size: 0.9rem; padding: 6px 14px; }
+        }
+    </style>
+    <link rel="icon" type="image/x-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='45' fill='%2333ff66'/></svg>">
+</head>
+<body>
+<canvas id="canvas" width="1920" height="1080"></canvas>
+<div class="game-stats">
+    🐍 LENGTH: <span id="lengthValue">0</span> &nbsp;&nbsp;| 🍎 SCORE: <span id="scoreValue">0</span>
+</div>
+<div class="controls-tip">
+    ⬆️ ⬇️ ⬅️ ➡️ &nbsp;&nbsp;|&nbsp;&nbsp; M = minimap &nbsp;&nbsp;|&nbsp;&nbsp; G = glow
+</div>
+
+<script>
+    (function(){
+        // ---------- GLOBALS ----------
+        const canvas = document.getElementById("canvas");
+        const ctx = canvas.getContext("2d", { alpha: false });
+        const gameWidth = 1920;
+        const gameHeight = 1080;
+        const gameHalfWidth = 960;
+        const gameHalfHeight = 540;
+        
+        // World & game settings
+        const WORLD_RADIUS = 9800;
+        const GRID_SIZE = 180;
+        let timeScale = 1.0;
+        let shadows = true;
+        let inspect = false;
+        let minimapExpanded = false;
+        let minimapZoom = 0.095;
+        const minimapWidth = 250;
+        const minimapHeight = 200;
+        
+        // Collections
+        let worms = [];
+        let energies = [];
+        let camera;
+        let filmedWormIndex = 0;
+        let animationId = null;
+        
+        // Keyboard state
+        let keysPressed = [];
+        
+        // Score tracking
+        let totalEaten = 0;
+        
+        // ---------- HELPER MATH ----------
+        function point(x, y) { return { x, y }; }
+        function distance(p1, p2) { return Math.hypot(p1.x - p2.x, p1.y - p2.y); }
+        function distanceManhattan(p1, p2) { return Math.abs(p1.x - p2.x) + Math.abs(p1.y - p2.y); }
+        function clampMin(v, min) { return Math.max(v, min); }
+        function clampMax(v, max) { return Math.min(v, max); }
+        function clamp(v, mn, mx) { return Math.min(Math.max(v, mn), mx); }
+        function interpolateLinear(a, b, t) { return a + (b - a) * t; }
+        function interpolateQuadratic(start, end, t) {
+            if (t < 0.5) return start + (end-start) * (2 * t * t);
+            return start + (end-start) * (1 - Math.pow(-2 * t + 2, 2) / 2);
+        }
+        function calculateAngleDifference(a1, a2) {
+            let d = a2 - a1;
+            while (d < -Math.PI) d += 2*Math.PI;
+            while (d > Math.PI) d -= 2*Math.PI;
+            return d;
+        }
+        function pointInCircle(p, c) { return distance(c.center, p) <= c.radius; }
+        function pointInRectangle(p, rect, pad=0) {
+            return p.x >= rect.center.x - rect.width/2 - pad && p.x <= rect.center.x + rect.width/2 + pad &&
+                   p.y >= rect.center.y - rect.height/2 - pad && p.y <= rect.center.y + rect.height/2 + pad;
+        }
+        function hueString(hue) { return `hsl(${hue}, 100%, 55%)`; }
+        function getShadows() { return shadows ? clampMin(20 * camera.zoom, 20) : 0; }
+        
+        // ---------- CAMERA ----------
+        class Camera {
+            constructor() {
+                this.x = 0; this.y = 0;
+                this.targetX = 0; this.targetY = 0;
+                this.zoom = 0.9;
+                this.filmedObject = null;
+            }
+            setTarget(p) { this.targetX = p.x; this.targetY = p.y; }
+            moveToSmooth(p) {
+                this.x = interpolateLinear(this.x, p.x, 0.19);
+                this.y = interpolateLinear(this.y, p.y, 0.19);
+            }
+            tick() { this.moveToSmooth(point(this.targetX, this.targetY)); }
+            follow(obj) { this.filmedObject = obj; if(obj) this.setTarget(obj.nodes?.[0] || obj); }
+            unfollow() { this.filmedObject = null; }
+        }
+        
+        // ---------- ENERGY (food) ----------
+        class Energy {
+            constructor(camera) {
+                this.camera = camera;
+                let angle = 2 * Math.PI * Math.random();
+                let rad = WORLD_RADIUS * Math.sqrt(Math.random());
+                this.x = rad * Math.cos(angle);
+                this.y = rad * Math.sin(angle);
+                this.type = Math.floor(Math.random() * 3) + 1;
+                this.rStatic = 2 * Math.PI * Math.random();
+                this.phase = 2 * Math.PI * Math.random();
+                this.r = this.rStatic;
+                this.isDecaying = false;
+                this.opacity = 1;
+                this.isDestroyed = false;
+                this.botWorm = null;
+            }
+            decay() { if(this.isDecaying) return; this.isDecaying = true; }
+            destroy(collection) {
+                this.isDestroyed = true;
+                let idx = collection.indexOf(this);
+                if(idx !== -1) collection.splice(idx,1);
+            }
+            tick(collection) {
+                if(this.isDecaying) {
+                    this.opacity -= 0.045 * timeScale;
+                    if(this.opacity <= 0) { this.destroy(collection); return; }
+                }
+                this.phase += 0.02 * timeScale;
+                this.r = this.rStatic + 0.22 * Math.sin(this.phase);
+            }
+            inGame(cam) {
+                let pad = 80 * cam.zoom + clampMin(20*cam.zoom,20);
+                return pointInRectangle(point(this.x - cam.x, this.y - cam.y), 
+                    rectangle(point(0,0), gameWidth/cam.zoom, gameHeight/cam.zoom), pad);
+            }
+            inMinimap(cam, expanded) {
+                let pad = 80 * cam.zoom * minimapZoom + 20;
+                let w = expanded ? gameWidth : minimapWidth;
+                let h = expanded ? gameHeight : minimapHeight;
+                let scale = cam.zoom * minimapZoom;
+                return pointInRectangle(point(this.x - cam.x, this.y - cam.y),
+                    rectangle(point(0,0), w/scale, h/scale), pad);
+            }
+        }
+        
+        // ---------- WORM with full arrow control (Up/Down = speed boost / slow, Left/Right = turn) ----------
+        class Worm {
+            constructor(camera, isPlayer = false) {
+                this.camera = camera;
+                this.nodes = [];
+                this.controllable = isPlayer;
+                this.dead = false;
+                this.hue = isPlayer ? 105 : 180 + Math.random() * 160;
+                this.type = isPlayer ? 1 : Math.floor(Math.random() * 4) + 1;
+                this.blink = 0; this.blinkDir = 0; this.blinkWait = 20 + Math.random() * 120;
+                this.happiness = 0; this.happinessWait = 0; this.happinessDir = -1;
+                this.turn = 0;
+                this.speedBoost = 1.0;      // NEW: speed multiplier controlled by Up/Down arrows
+                
+                // spawn inside world
+                let startAngle = 2 * Math.PI * Math.random();
+                let startRad = WORLD_RADIUS * 0.6 * Math.random();
+                let headX = startRad * Math.cos(startAngle);
+                let headY = startRad * Math.sin(startAngle);
+                let headRot = 2 * Math.PI * Math.random();
+                this.nodes.push({ active: true, activeTime: 1, x: headX, y: headY, r: headRot, rs: 0 });
+                let initLen = isPlayer ? 16 : 8 + Math.floor(Math.random() * 28);
+                for(let i=1; i<initLen; i++) {
+                    let prev = this.nodes[i-1];
+                    this.nodes.push({
+                        active: true, activeTime: 1,
+                        x: prev.x - 18 * Math.cos(prev.r),
+                        y: prev.y - 18 * Math.sin(prev.r),
+                        r: prev.r
+                    });
+                }
+                if(!isPlayer) {
+                    this.botWait = 0;
+                    this.botDesiredDirection = this.nodes[0].r;
+                    this.botEnergy = null;
+                }
+            }
+            
+            setControllable(val) {
+                if(val === this.controllable) return;
+                this.controllable = val;
+                if(!val && !this.botWait) {
+                    this.botWait = 0;
+                    this.botDesiredDirection = this.nodes[0].r;
+                    this.botEnergy = null;
+                }
+            }
+            
+            addNodeSmooth(count=1) {
+                for(let i=0;i<count;i++) {
+                    let last = this.nodes[this.nodes.length-1];
+                    this.nodes.push({
+                        active: false, activeTime: 0,
+                        x: last.x, y: last.y, r: last.r
+                    });
+                }
+            }
+            
+            increaseHappiness(val) { this.happiness = clamp(this.happiness + val, 0, 1); }
+            decreaseHappiness(val) { this.happiness = clamp(this.happiness - val, 0, 1); }
+            die() { this.dead = true; }
+            
+            // NEW: handle speed boost from Up/Down arrows
+            updateSpeedFromInput() {
+                if(!this.controllable) return;
+                // Up arrow = speed up, Down arrow = slow down
+                if(keysPressed.includes("ArrowUp")) {
+                    this.speedBoost = Math.min(2.2, this.speedBoost + 0.025);
+                } else if(keysPressed.includes("ArrowDown")) {
+                    this.speedBoost = Math.max(0.65, this.speedBoost - 0.025);
+                } else {
+                    // gradually return to normal speed 1.0
+                    if(this.speedBoost > 1.0) this.speedBoost = Math.max(1.0, this.speedBoost - 0.02);
+                    if(this.speedBoost < 1.0) this.speedBoost = Math.min(1.0, this.speedBoost + 0.02);
+                }
+            }
+            
+            tick(wormArray) {
+                if(this.dead) return;
+                const head = this.nodes[0];
+                
+                // update speed boost for player
+                if(this.controllable) this.updateSpeedFromInput();
+                
+                // AI logic (unchanged but respects same movement)
+                if(!this.controllable) {
+                    this.botWait -= timeScale;
+                    if(this.botWait <= 0) {
+                        let bestEnergy = null;
+                        let bestDist = Infinity;
+                        for(let e of energies) {
+                            if(e.isDestroyed) continue;
+                            let d = distance(head, e);
+                            if(d < 550 && d < bestDist) {
+                                bestDist = d;
+                                bestEnergy = e;
+                            }
+                        }
+                        if(bestEnergy) {
+                            let angleTo = Math.atan2(head.y - bestEnergy.y, head.x - bestEnergy.x);
+                            this.botDesiredDirection = angleTo;
+                            bestEnergy.botWorm = this;
+                        } else {
+                            this.botDesiredDirection += (Math.random() - 0.5) * 1.2;
+                            this.botDesiredDirection %= 2*Math.PI;
+                        }
+                        let diff = calculateAngleDifference(head.r, this.botDesiredDirection);
+                        this.turn = (diff > 0.03) ? 1 : (diff < -0.03) ? -1 : 0;
+                        this.botWait = 25 + Math.random() * 35;
+                    }
+                }
+                
+                // apply turn & movement (speed is multiplied by speedBoost)
+                let baseSpeed = 3.9;
+                let currentMoveSpeed = baseSpeed * this.speedBoost * timeScale;
+                
+                if(this.turn === -1) head.rs = clampMax(head.rs + Math.PI/360, Math.PI/92);
+                else if(this.turn === 1) head.rs = clampMin(head.rs - Math.PI/360, -Math.PI/92);
+                else {
+                    if(head.rs < 0) head.rs = Math.min(0, head.rs + Math.PI/1500);
+                    if(head.rs > 0) head.rs = Math.max(0, head.rs - Math.PI/1500);
+                }
+                head.r += head.rs * timeScale;
+                head.r %= 2*Math.PI;
+                head.x += currentMoveSpeed * Math.cos(head.r);
+                head.y += currentMoveSpeed * Math.sin(head.r);
+                
+                // body follow (smooth)
+                for(let i=1; i<this.nodes.length; i++) {
+                    let curr = this.nodes[i];
+                    let prev = this.nodes[i-1];
+                    if(!curr.active && distance(curr, prev) >= 7) curr.active = true;
+                    if(curr.active) {
+                        curr.activeTime = Math.min(1, curr.activeTime + 0.06 * timeScale);
+                        let angle = Math.atan2(prev.y - curr.y, prev.x - curr.x);
+                        curr.r = angle;
+                        let idealDist = 13;
+                        curr.x = prev.x - idealDist * Math.cos(angle);
+                        curr.y = prev.y - idealDist * Math.sin(angle);
+                    }
+                }
+                
+                // world boundary kill
+                if(!pointInCircle(head, { center: point(0,0), radius: WORLD_RADIUS - 45 })) {
+                    this.dead = true;
+                }
+                
+                // happiness from nearby worms
+                let nearFriend = false;
+                for(let w of wormArray) {
+                    if(w !== this && !w.dead && distance(this.nodes[0], w.nodes[0]) < 160) nearFriend = true;
+                }
+                if(nearFriend) this.happinessWait = Math.min(50, this.happinessWait + timeScale);
+                else this.happinessWait = Math.max(0, this.happinessWait - timeScale);
+                this.happinessDir = (this.happinessWait >= 48) ? 1 : (this.happinessWait <= 2) ? -1 : this.happinessDir;
+                if(this.happinessDir === 1) this.increaseHappiness(0.025 * timeScale);
+                else this.decreaseHappiness(0.018 * timeScale);
+                
+                // blinking
+                this.blinkWait -= timeScale;
+                if(this.blinkWait <= 0) {
+                    this.blinkWait = (this.happiness > 0.5 ? 40 + Math.random()*70 : 150 + Math.random()*140);
+                    this.blinkDir = 1;
+                }
+                this.blink += 0.12 * this.blinkDir * timeScale;
+                if(this.blink > 1) { this.blink = 2-this.blink; this.blinkDir = -1; }
+                if(this.blink < 0) { this.blink = 0; this.blinkDir = 0; }
+                
+                // camera follow
+                if(this.camera.filmedObject === this) this.camera.setTarget(this.nodes[0]);
+            }
+            
+            inGame(cam) {
+                let pad = 80 * cam.zoom + getShadows();
+                for(let n of this.nodes) {
+                    if(pointInRectangle(point(n.x - cam.x, n.y - cam.y),
+                        rectangle(point(0,0), gameWidth/cam.zoom, gameHeight/cam.zoom), pad)) return true;
+                }
+                return false;
+            }
+            inMinimap(cam, expanded) {
+                let pad = 80 * cam.zoom * minimapZoom + 20;
+                let w = expanded ? gameWidth : minimapWidth;
+                let h = expanded ? gameHeight : minimapHeight;
+                let scale = cam.zoom * minimapZoom;
+                for(let n of this.nodes) {
+                    if(pointInRectangle(point(n.x - cam.x, n.y - cam.y),
+                        rectangle(point(0,0), w/scale, h/scale), pad)) return true;
+                }
+                return false;
+            }
+        }
+        
+        function rectangle(center, w, h) { return { center, width: w, height: h }; }
+        
+        // ----- GAME INIT -----
+        function initGame() {
+            worms = [];
+            energies = [];
+            camera = new Camera();
+            let playerWorm = new Worm(camera, true);
+            playerWorm.setControllable(true);
+            playerWorm.hue = 95;
+            playerWorm.type = 1;
+            worms.push(playerWorm);
+            camera.follow(playerWorm);
+            filmedWormIndex = 0;
+            
+            // 28 AI worms
+            for(let i=0;i<28;i++) {
+                let ai = new Worm(camera, false);
+                ai.setControllable(false);
+                worms.push(ai);
+            }
+            
+            // 700 food pellets
+            for(let i=0;i<700;i++) {
+                energies.push(new Energy(camera));
+            }
+            totalEaten = 0;
+            updateUI();
+        }
+        
+        // handle eating & growth
+        function handleEatCollisions() {
+            for(let i=0; i<energies.length; i++) {
+                let energy = energies[i];
+                if(energy.isDecaying || energy.isDestroyed) continue;
+                for(let w of worms) {
+                    if(w.dead) continue;
+                    let head = w.nodes[0];
+                    let dist = distance(head, energy);
+                    if(dist < 45) {
+                        if(!energy.isDecaying) {
+                            energy.decay();
+                            let growAmount = 4;
+                            w.addNodeSmooth(growAmount);
+                            if(w.controllable) {
+                                totalEaten++;
+                                updateUI();
+                            }
+                            w.increaseHappiness(0.12);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        
+        function updateUI() {
+            const player = worms[0];
+            if(player && !player.dead) {
+                document.getElementById("lengthValue").innerText = player.nodes.length;
+                document.getElementById("scoreValue").innerText = totalEaten;
+            } else {
+                document.getElementById("lengthValue").innerText = "0";
+                document.getElementById("scoreValue").innerText = totalEaten;
+            }
+        }
+        
+        // ---------- RENDERING (rich visuals) ----------
+        function renderWorldAndWorms() {
+            ctx.fillStyle = "#03050b";
+            ctx.fillRect(0,0,gameWidth,gameHeight);
+            ctx.save();
+            ctx.translate(gameHalfWidth, gameHalfHeight);
+            ctx.scale(1, -1);
+            ctx.scale(camera.zoom, camera.zoom);
+            ctx.translate(-camera.x, -camera.y);
+            
+            // grid & border
+            ctx.save();
+            ctx.strokeStyle = "#2a3a2a";
+            ctx.lineWidth = 2.2;
+            for(let i=1; i<2*WORLD_RADIUS/GRID_SIZE; i++) {
+                let pos = i*GRID_SIZE - WORLD_RADIUS;
+                ctx.beginPath(); ctx.moveTo(pos, -WORLD_RADIUS); ctx.lineTo(pos, WORLD_RADIUS); ctx.stroke();
+                ctx.beginPath(); ctx.moveTo(-WORLD_RADIUS, pos); ctx.lineTo(WORLD_RADIUS, pos); ctx.stroke();
+            }
+            ctx.beginPath(); ctx.arc(0,0,WORLD_RADIUS,0,2*Math.PI);
+            ctx.strokeStyle = "#3c6e47";
+            ctx.lineWidth = 9;
+            ctx.stroke();
+            ctx.restore();
+            
+            // energies
+            ctx.save();
+            ctx.shadowBlur = getShadows();
+            for(let e of energies) {
+                if(e.inGame(camera) && !e.isDestroyed) {
+                    ctx.globalAlpha = e.opacity;
+                    ctx.save();
+                    ctx.translate(e.x, e.y);
+                    ctx.rotate(e.r);
+                    let strokeC = e.type===1 ? "#ff5555" : (e.type===2 ? "#2ad4ff" : "#ffaa44");
+                    ctx.beginPath();
+                    if(e.type === 1) { ctx.moveTo(0,22); ctx.lineTo(-19,-11); ctx.lineTo(19,-11); }
+                    else if(e.type === 2) { ctx.rect(-16,-16,32,32); }
+                    else { ctx.arc(0,0,22,0,Math.PI); }
+                    ctx.fillStyle = "#000000";
+                    ctx.shadowBlur = 0;
+                    ctx.fill();
+                    ctx.lineWidth = 2.8;
+                    ctx.strokeStyle = strokeC;
+                    ctx.shadowColor = strokeC;
+                    ctx.shadowBlur = getShadows();
+                    ctx.stroke();
+                    ctx.restore();
+                }
+            }
+            ctx.restore();
+            
+            // worms drawing
+            ctx.save();
+            ctx.shadowBlur = getShadows();
+            for(let w of worms) {
+                if(w.dead) continue;
+                if(!w.inGame(camera)) continue;
+                let color = hueString(w.hue);
+                ctx.lineWidth = 3.5;
+                ctx.strokeStyle = color;
+                ctx.fillStyle = color;
+                ctx.shadowColor = color;
+                ctx.beginPath();
+                let head = w.nodes[0];
+                ctx.arc(head.x, head.y, 24, head.r - Math.PI/2, head.r + Math.PI/2);
+                for(let i=1; i<w.nodes.length-1; i++) {
+                    ctx.save(); ctx.translate(w.nodes[i].x, w.nodes[i].y); ctx.rotate(w.nodes[i].r);
+                    ctx.lineTo(0, 24); ctx.restore();
+                }
+                let tail = w.nodes[w.nodes.length-1];
+                ctx.arc(tail.x, tail.y, 24, tail.r + Math.PI/2, tail.r - Math.PI/2);
+                for(let i=w.nodes.length-2; i>0; i--) {
+                    ctx.save(); ctx.translate(w.nodes[i].x, w.nodes[i].y); ctx.rotate(w.nodes[i].r);
+                    ctx.lineTo(0, -24); ctx.restore();
+                }
+                ctx.closePath();
+                ctx.fillStyle = "#03050b";
+                ctx.shadowBlur = 0;
+                ctx.fill();
+                ctx.lineWidth = 22;
+                ctx.strokeStyle = "#03050b";
+                ctx.stroke();
+                ctx.lineWidth = 3.2;
+                ctx.strokeStyle = color;
+                ctx.shadowBlur = getShadows();
+                ctx.stroke();
+                
+                // face details
+                ctx.save();
+                ctx.translate(head.x, head.y);
+                ctx.rotate(head.r);
+                let smileX = interpolateQuadratic(12, 6, w.happiness);
+                let smileY = interpolateQuadratic(-11, -15, w.happiness);
+                ctx.beginPath();
+                ctx.moveTo(smileX, smileY);
+                ctx.bezierCurveTo(interpolateQuadratic(4,19,w.happiness), -7, interpolateQuadratic(4,19,w.happiness), 7, smileX, -smileY);
+                ctx.lineWidth = 2.5;
+                ctx.strokeStyle = color;
+                ctx.stroke();
+                let eyeScale = 2.3 * (1 - w.blink);
+                ctx.beginPath(); ctx.ellipse(0, -6, eyeScale, 2.2, 0, 0, 2*Math.PI); ctx.fillStyle = color; ctx.fill();
+                ctx.beginPath(); ctx.ellipse(0, 6, eyeScale, 2.2, 0, 0, 2*Math.PI); ctx.fill();
+                ctx.restore();
+            }
+            ctx.restore();
+            ctx.restore(); // back from world transform
+            
+            // minimap
+            ctx.save();
+            if(!minimapExpanded) {
+                ctx.translate(gameWidth - minimapWidth - 14, gameHeight - minimapHeight - 14);
+                ctx.scale(1,-1);
+                ctx.beginPath(); ctx.rect(0, -minimapHeight, minimapWidth, minimapHeight); ctx.clip();
+                ctx.fillStyle = "#08142e"; ctx.globalAlpha=0.85; ctx.fillRect(0, -minimapHeight, minimapWidth, minimapHeight);
+            } else {
+                ctx.translate(gameHalfWidth, gameHalfHeight);
+                ctx.scale(1,-1);
+                ctx.fillStyle = "#08142ecc"; ctx.fillRect(-gameHalfWidth, -gameHalfHeight, gameWidth, gameHeight);
+            }
+            ctx.scale(camera.zoom * minimapZoom, camera.zoom * minimapZoom);
+            ctx.translate(-camera.x, -camera.y);
+            ctx.beginPath(); ctx.arc(0,0,WORLD_RADIUS,0,2*Math.PI); ctx.lineWidth=18; ctx.strokeStyle="#558866"; ctx.stroke();
+            for(let e of energies) {
+                if(e.inMinimap(camera, minimapExpanded) && !e.isDestroyed) {
+                    let col = e.type===1?"#ff8888": e.type===2?"#66ddff":"#ffbb66";
+                    ctx.fillStyle = col; ctx.shadowBlur=0;
+                    ctx.beginPath(); ctx.arc(e.x, e.y, 16, 0, 2*Math.PI); ctx.fill();
+                }
+            }
+            for(let w of worms) {
+                if(w.dead) continue;
+                if(w.inMinimap(camera, minimapExpanded)) {
+                    ctx.beginPath();
+                    for(let i=0;i<w.nodes.length;i++) ctx.lineTo(w.nodes[i].x, w.nodes[i].y);
+                    ctx.lineWidth = 32; ctx.strokeStyle = hueString(w.hue); ctx.shadowBlur=0; ctx.stroke();
+                }
+            }
+            ctx.restore();
+            if(!minimapExpanded) {
+                ctx.beginPath(); ctx.rect(gameWidth - minimapWidth - 10, gameHeight - minimapHeight - 10, minimapWidth, minimapHeight);
+                ctx.lineWidth = 3; ctx.strokeStyle = "#2f6b47"; ctx.stroke();
+            }
+        }
+        
+        // ---------- INPUT HANDLER: full arrow control (Left/Right turn, Up/Down speed) ----------
+        function updateTurnAndSpeed() {
+            for(let w of worms) {
+                if(w.controllable && !w.dead) {
+                    // Left/Right for turning
+                    w.turn = 0;
+                    if(keysPressed.includes("ArrowLeft") || keysPressed.includes("a") || keysPressed.includes("A")) w.turn -= 1;
+                    if(keysPressed.includes("ArrowRight") || keysPressed.includes("d") || keysPressed.includes("D")) w.turn += 1;
+                    // Up/Down speed is handled inside worm.tick via updateSpeedFromInput()
+                }
+            }
+        }
+        
+        function keydown(e) {
+            let k = e.key;
+            if(!keysPressed.includes(k)) keysPressed.push(k);
+            updateTurnAndSpeed();
+            if(k === "m" || k === "M") minimapExpanded = !minimapExpanded;
+            if(k === "g" || k === "G") shadows = !shadows;
+            if(k === "i" || k === "I") inspect = !inspect;
+            if(k === "-" || k === "_") timeScale = clamp(timeScale-0.02,0.5,5);
+            if(k === "+" || k === "=") timeScale = clamp(timeScale+0.02,0.5,5);
+            e.preventDefault();
+        }
+        function keyup(e) {
+            let idx = keysPressed.indexOf(e.key);
+            if(idx !== -1) keysPressed.splice(idx,1);
+            updateTurnAndSpeed();
+        }
+        function mousedown(e) { if(e.button === 0 && worms[0]) camera.follow(worms[0]); if(e.button === 2) camera.unfollow(); e.preventDefault(); }
+        function touchstart(e) {
+            e.preventDefault();
+            let rect = canvas.getBoundingClientRect();
+            let touchX = gameWidth * (e.touches[0].clientX - rect.left)/rect.width;
+            if(worms[0]) worms[0].turn = (touchX > gameWidth/2) ? 1 : -1;
+        }
+        function touchend(e) { if(worms[0]) worms[0].turn = 0; }
+        
+        window.addEventListener("resize", ()=>{
+            let ww = window.innerWidth, wh = window.innerHeight;
+            if(ww/wh > gameWidth/gameHeight) canvas.style.cssText = `width:${(wh/ww)*(gameWidth/gameHeight)*100}%; height:100%`;
+            else canvas.style.cssText = `width:100%; height:${(ww/wh)*(gameHeight/gameWidth)*100}%`;
+        });
+        window.addEventListener("keydown", keydown); window.addEventListener("keyup", keyup);
+        window.addEventListener("mousedown", mousedown); window.addEventListener("contextmenu", e=>e.preventDefault());
+        window.addEventListener("touchstart", touchstart); window.addEventListener("touchend", touchend);
+        
+        function gameLoop() {
+            for(let w of worms) if(!w.dead) w.tick(worms);
+            handleEatCollisions();
+            camera.tick();
+            if(worms[0] && worms[0].dead) initGame();
+            renderWorldAndWorms();
+            updateUI();
+            animationId = requestAnimationFrame(gameLoop);
+        }
+        
+        initGame();
+        window.dispatchEvent(new Event("resize"));
+        gameLoop();
+    })();
+</script>
+</body>
+</html>
